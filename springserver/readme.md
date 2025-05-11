@@ -9,7 +9,10 @@ Este proyecto implementa una API REST que devuelve productos similares a uno dad
 - **Spring Boot 3.2.5**: Framework base para la aplicación
 - **Spring WebFlux**: Para programación reactiva no bloqueante
 - **Reactor**: Biblioteca para programación reactiva con soporte para operaciones asíncronas
+- **Resilience4j**: Framework para implementar patrones de resiliencia
 - **Caffeine Cache**: Sistema de caché de alto rendimiento con soporte reactivo
+- **Micrometer**: Para métricas y monitorización
+- **Prometheus**: Exposición de métricas para monitoreo
 - **Lombok**: Para reducir código boilerplate
 
 ## Arquitectura y Componentes
@@ -22,8 +25,8 @@ Controller → Service → Client → API Externa
 
 - **Controller**: Expone el endpoint REST y maneja la respuesta HTTP
 - **Service**: Contiene la lógica de negocio y orquesta las llamadas
-- **Client**: Gestiona la comunicación con APIs externas
-- **Config**: Configuraciones del sistema (WebClient, Cache, etc.)
+- **Client**: Gestiona la comunicación con APIs externas con patrones de resiliencia
+- **Config**: Configuraciones del sistema (WebClient, Cache, Resilience4j, etc.)
 - **Model**: Objetos de dominio
 
 ## Decisiones Técnicas y Justificación
@@ -52,67 +55,155 @@ public Mono<ProductDetail> getProductDetail(String productId) { ... }
 - **Políticas de Expiración**: 5 minutos para equilibrar frescura de datos y eficiencia
 - **Optimización de Memoria**: Límite de 1000 entradas para evitar problemas de memoria
 
-### 3. Paralelización y Concurrencia
+### 3. Patrones de Resiliencia con Resilience4j
+
+Implementé múltiples patrones de resiliencia para garantizar la estabilidad del sistema:
+
+#### Circuit Breaker
+
+Previene llamadas a servicios que están fallando repetidamente:
+
+```java
+CircuitBreakerConfig circuitBreakerConfig = CircuitBreakerConfig.custom()
+    .slidingWindowSize(10)
+    .failureRateThreshold(50)
+    .waitDurationInOpenState(Duration.ofSeconds(10))
+    .build();
+```
+
+- **Ventana Deslizante**: Evalúa los últimos 10 llamados
+- **Umbral de Fallos**: Si el 50% de las llamadas fallan, se abre el circuito
+- **Tiempo de Espera en Estado Abierto**: 10 segundos antes de intentar llamadas nuevamente
+
+#### Retry con Backoff Exponencial
+
+Reintentos inteligentes para errores transitorios:
+
+```java
+RetryConfig retryConfig = RetryConfig.custom()
+    .maxAttempts(3)
+    .retryExceptions(IOException.class, ConnectException.class)
+    .intervalFunction(IntervalFunction.ofExponentialBackoff(1000, 1.5, 5000))
+    .build();
+```
+
+- **Máximo de Intentos**: 3 intentos antes de fallar
+- **Backoff Exponencial**: Espera creciente entre intentos (1s, 1.5s, 2.25s)
+- **Excepciones Específicas**: Solo reintenta errores de red, no errores de negocio
+
+#### Time Limiter
+
+Control estricto de timeouts:
+
+```java
+TimeLimiterConfig timeLimiterConfig = TimeLimiterConfig.custom()
+    .timeoutDuration(Duration.ofSeconds(3))
+    .cancelRunningFuture(true)
+    .build();
+```
+
+- **Timeout Configurable**: 3 segundos por operación
+- **Cancelación de Operaciones**: Libera recursos al cancelar operaciones con timeout
+
+#### Bulkhead
+
+Limita el número de llamadas concurrentes:
+
+```java
+BulkheadConfig bulkheadConfig = BulkheadConfig.custom()
+    .maxConcurrentCalls(20)
+    .maxWaitDuration(Duration.ofMillis(500))
+    .build();
+```
+
+- **Control de Concurrencia**: Máximo 20 llamadas simultáneas
+- **Tiempo de Espera**: Si se alcanza el límite, las nuevas solicitudes esperan hasta 500ms
+
+### 4. Paralelización y Concurrencia
 
 Diseñé un sistema de procesamiento paralelo configurable:
 
 ```java
 return Flux.fromIterable(ids)
-    .flatMap(id -> getProductDetailWithTimeout(id), concurrencyLevel);
+    .flatMap(id -> getProductDetailWithFallback(id), concurrencyLevel);
 ```
 
 - **Nivel de Paralelismo Configurable**: Ajustable mediante propiedades (`app.similar-products.concurrency`)
 - **Procesamiento Independiente**: Cada producto se procesa de forma aislada para evitar que fallos únicos afecten al conjunto
 
-### 4. Gestión de Timeouts y Resiliencia
+### 5. Gestión de Errores y Degradación Elegante
 
-Implementé un sistema de timeouts en varios niveles:
+Implementé múltiples niveles de fallback:
 
 ```java
-return productApiClient.getProductDetail(id)
-    .timeout(Duration.ofSeconds(3))
+return productApiClient.getProductDetail(productId)
     .onErrorResume(e -> {
-        if (e instanceof TimeoutException) {
-            logger.warn("Timeout al obtener detalle para producto {}", id);
-            return Mono.empty();
+        if (e instanceof ProductNotFoundException) {
+            return Mono.error(e);  // Propagamos errores críticos
+        } else {
+            return getProductDetailFallback(productId);  // Fallback para otros errores
         }
-        // Error handling...
     });
 ```
 
-- **Resultados Parciales**: Si un producto falla, continúa con el resto
-- **Timeouts Configurables**: Por producto y por operación completa
-- **Reintentos Limitados**: Solo para errores recuperables
+- **Degradación por Niveles**: Responde con resultados parciales si es posible
+- **Fallbacks Personalizados**: Estrategias específicas por tipo de error
+- **Registro Detallado**: Log de errores para diagnóstico posterior
 
-### 5. WebClient Optimizado
+### 6. Monitoreo y Métricas con Micrometer
 
-Configuré un WebClient con:
+Incluí métricas detalladas para observabilidad:
 
-- **Pool de Conexiones Administrado**: Para evitar el agotamiento de conexiones
-- **Timeouts Explícitos**: Para conexión y respuesta
-- **Buffer Ampliado**: Para manejar respuestas más grandes
+```java
+@Timed(value = "get_similar_products_service")
+public Flux<ProductDetail> getSimilarProducts(String productId) {
+    meterRegistry.counter("similar_products.requests", "productId", productId).increment();
+    // ...
+}
+```
+
+- **Métricas de Rendimiento**: Tiempos de respuesta, tasas de éxito/error
+- **Estado del Circuit Breaker**: Monitoreo del estado de resiliencia
+- **Exposición Prometheus**: Endpoint para integración con sistemas de monitoreo
+- **Anotaciones @Timed**: Medición automática de latencias
 
 ## Optimizaciones Implementadas
 
 1. **Caché Reactivo**:
-
    - Reduce llamadas a servicios externos
    - Mejora drásticamente tiempo de respuesta para peticiones repetidas
 
 2. **Procesamiento en Paralelo**:
-
    - Solicita detalles de múltiples productos simultáneamente
    - Nivel de paralelismo configurable según capacidad del sistema
 
 3. **Manejo de Fallos**:
-
+   - Circuit Breaker para prevenir cascadas de fallos
    - Degradación elegante ante fallos parciales
-   - Continúa operando incluso cuando algunos productos no responden
-   - Timeouts individuales para evitar bloqueos
+   - Timeouts individuales controlados con Time Limiter
 
 4. **Optimización de Recursos**:
-   - Uso de Scheduler específico para operaciones I/O
-   - Control de conexiones máximas y tiempos de espera
+   - Bulkhead para controlar concurrencia
+   - Gestión efectiva de conexiones HTTP
+
+## Pruebas Unitarias y de Integración
+
+El proyecto incluye tests unitarios utilizando StepVerifier para verificar el comportamiento reactivo:
+
+```java
+@Test
+void getSimilarProducts_WithPartialFailure() {
+    // Configuración...
+    StepVerifier.create(productService.getSimilarProducts(productId))
+        .expectNextMatches(product -> product.getId().equals("2"))
+        .expectNextMatches(product -> product.getId().equals("4"))
+        .verifyComplete();
+}
+```
+
+- **Tests de Resiliencia**: Verificación de comportamiento ante fallos
+- **StepVerifier**: Validación de flujos reactivos
+- **Simulación de Timeouts**: Pruebas de comportamiento ante latencias elevadas
 
 ## Cómo Ejecutar la Aplicación
 
@@ -155,6 +246,21 @@ Configuré un WebClient con:
    ```bash
       java -jar target/similar-products-0.0.1-SNAPSHOT.jar
    ```
+
+### Monitoreo
+
+La aplicación expone métricas en formato Prometheus:
+
+```
+http://localhost:5000/actuator/prometheus
+```
+
+También puedes ver el estado de los circuit breakers:
+
+```
+http://localhost:5000/actuator/circuitbreakers
+```
+
 ### Pruebas de Rendimiento
 
 Para ejecutar tests de carga:
@@ -165,13 +271,29 @@ docker-compose run --rm k6 run scripts/test.js
 
 Visualizar resultados en: `http://localhost:3000/d/Le2Ku9NMk/k6-performance-test`
 
-## Desafíos Superados
+## Desafíos Superados y Aprendizajes
 
-1. **Compatibilidad Reactiva con Caché**: Configuración especial de caché asíncrono
-2. **Timeouts Individuales**: Manejo de timeouts por producto sin afectar al resto
-3. **Optimización de Rendimiento**: Balance entre paralelismo y uso de recursos
-4. **Manejo de Errores Consistente**: Respuestas coherentes incluso con fallos parciales
+1. **Integración de Resilience4j con WebFlux**:
+   - Uso de operadores reactivos específicos (CircuitBreakerOperator, TimeLimiterOperator)
+   - Configuración óptima para patrones de resiliencia en contextos reactivos
 
----
+2. **Manejo Efectivo de Timeouts**:
+   - Control multinivel (global, por servicio, por operación)
+   - Cancelación apropiada de operaciones para liberar recursos
 
-Este proyecto demuestra mi enfoque en construir sistemas resilientes, de alto rendimiento y mantenibles, equilibrando la complejidad técnica con soluciones pragmáticas.
+3. **Optimización de Rendimiento**:
+   - Balance entre paralelismo y uso de recursos
+   - Configuración de bulkhead para prevenir saturación
+
+4. **Monitoreo Detallado**:
+   - Diseño de métricas significativas para operaciones críticas
+   - Exposición de datos de health para sistemas externos
+
+### Monitoreo de patrones activos
+```bash
+# Ver estado actual de los circuit breakers
+curl -X GET "http://localhost:5000/actuator/circuitbreakers"
+
+# Ver métricas en formato Prometheus
+curl -X GET "http://localhost:5000/actuator/prometheus" | grep resilience4j
+```
